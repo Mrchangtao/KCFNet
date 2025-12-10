@@ -1,0 +1,531 @@
+
+import torch
+import torch.nn as nn
+import torchvision
+from matplotlib import pyplot as plt
+from models.SwinT import SwinTransformer
+import torch.nn.functional as F
+import os
+import onnx
+from .Fusion_kan import *
+from .Enhance import *
+from .vmamba import SSM 
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+
+
+def conv3x3(in_planes, out_planes, stride=1, has_bias=False):
+    "3x3 convolution with padding"
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=1, bias=has_bias)
+
+
+def conv3x3_bn_relu(in_planes, out_planes, stride=1):
+    return nn.Sequential(
+        conv3x3(in_planes, out_planes, stride),
+        nn.BatchNorm2d(out_planes),
+        nn.ReLU(inplace=True),
+    )
+def conv1x1_bn_relu(in_channels, out_channels):
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, kernel_size=1),
+        nn.BatchNorm2d(out_channels),
+        nn.ReLU(inplace=True)
+    )
+
+class Upsample(torch.nn.Module):
+    def __init__(self, target_size):
+        super(Upsample, self).__init__()
+        self.target_size = target_size
+
+    def forward(self, x):
+        x = F.interpolate(x, size=self.target_size, mode='bilinear', align_corners=False)
+        return x
+
+
+class MICNet(nn.Module):
+    def __init__(self, norm_layer=nn.LayerNorm):
+        super(MICNet, self).__init__()
+
+        self.rgb_swin = SwinTransformer(embed_dim=128, depths=[2, 2, 18, 2], num_heads=[4, 8, 16, 32])
+        self.depth_swin = SwinTransformer(embed_dim=128, depths=[2, 2, 18, 2], num_heads=[4, 8, 16, 32])
+
+        self.cmfm1 = CMFM_kan(1024, 12, 12)  # 多模态融合
+        self.cmfm2 = CMFM_kan(512, 24, 24)
+        self.cmfm3 = CMFM_kan(256, 48, 48)
+        self.cmfm4 = CMFM_kan(128, 96, 96)
+
+        self.emfm1 = EMFM(1024, 12, 12)
+        self.emfm2 = EMFM(1024, 24, 24)
+        self.emfm3 = EMFM(1024, 48, 48)
+        self.emfm4 = EMFM(1024, 96, 96)
+
+        self.upsample1 = Upsample(target_size=(96, 96))  # 上采样
+        self.upsample2 = Upsample(target_size=(96, 96))
+        self.upsample3 = Upsample(target_size=(96, 96))
+
+        self.conv96_256 = nn.Sequential(
+            nn.Conv2d(in_channels=96, out_channels=256, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True)
+        )
+        self.conv1024_256 = nn.Sequential(
+            nn.Conv2d(in_channels=1024, out_channels=256, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True)
+        )
+        self.conv1024_512 = nn.Sequential(
+            nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True)
+        )
+        # self.conv1024_2048 = nn.Sequential(
+        #     nn.Conv2d(in_channels=1024, out_channels=2048, kernel_size=1, stride=1, padding=0),
+        #     nn.BatchNorm2d(2048),
+        #     nn.ReLU(inplace=True)
+        # )
+        self.conv96_2048 = nn.Sequential(
+            nn.Conv2d(in_channels=96, out_channels=2048, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(2048),
+            nn.ReLU(inplace=True)
+        )
+
+        self.pool = nn.AdaptiveAvgPool2d((12, 12))
+        self.conv_out = nn.ConvTranspose2d(in_channels=3072, out_channels=1, kernel_size=4, stride=4, padding=0)
+
+        self.decoder = Decoder1()
+        self.decoder2 = Decoder2()
+
+        self.up2 = nn.UpsamplingBilinear2d(scale_factor=2)
+        self.up4 = nn.UpsamplingBilinear2d(scale_factor=4)
+
+        self.conv128_32 = conv3x3_bn_relu(128, 32)
+        self.conv64_1 = conv3x3(64, 1)
+
+        self.rgb_edge_layer = RGBEdgeModule()
+        self.depth_edge_layer = DepthEdgeModule()
+        self.CEF = CEF(32)
+        self.edge_feature = conv3x3_bn_relu(1, 32)
+        self.fuse_edge_sal = conv3x3(32, 1)
+        self.up_edge = nn.Sequential(
+            nn.UpsamplingBilinear2d(scale_factor=4),
+            conv3x3(32, 1)
+        )
+
+        # 定义卷积层,保持输入和输出的空间维度一致
+        self.convf1 = nn.Conv2d(in_channels=4096, out_channels=2048, kernel_size=3, stride=1, padding=1)
+        self.convf2 = nn.Conv2d(in_channels=2048, out_channels=1024, kernel_size=3, stride=1, padding=1)
+        self.convf3 = nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=3, stride=1, padding=1)
+        
+        self.relu = nn.ReLU(True)
+        self.fuse = conv3x3(1920,96)
+        self.ssm = SSM(d_model=96, d_state=4, ssm_ratio=1, dt_rank="auto", dt_min=0.001, dt_max=0.1, dt_init="random", dropout=0.1 )
+
+    def forward(self, x, d):
+        rgb_list = self.rgb_swin(x)
+        depth_list = self.depth_swin(d)
+
+        r4 = rgb_list[0]  # [8, 128, 96, 96]
+        r3 = rgb_list[1]  # [8, 256, 48, 48]
+        r2 = rgb_list[2]  # [8, 512, 24, 24]
+        r1 = rgb_list[3]  # [8, 1024, 12, 12]
+
+        d4 = depth_list[0]   # [8, 128, 96, 96]
+        d3 = depth_list[1]   # [8, 256, 48, 48]
+        d2 = depth_list[2]   # [8, 512, 24, 24]
+        d1 = depth_list[3]   # [8, 1024, 12, 12]
+
+        # 融合特征
+        fuse1 = self.cmfm1(r1, d1)  # [1, 1024, 12, 12]
+        fuse2 = self.cmfm2(r2, d2)  # [1, 512, 24, 24]
+        fuse3 = self.cmfm3(r3, d3)  # [1, 256, 48, 48]
+        fuse4 = self.cmfm4(r4, d4)  # [1, 128, 96, 96]
+
+        # rgb edge
+        rgb_edge_map = self.rgb_edge_layer(r4, r3)
+        rgb_edge_feature = self.edge_feature(rgb_edge_map)
+        # depth edge
+        depth_edge_map = self.depth_edge_layer(d4, d3)      # edge_map: torch.Size([2, 1, 96, 96])
+        depth_edge_feature = self.edge_feature(depth_edge_map)    # edge_feature: torch.Size([2, 32, 96, 96])
+
+        edge_cef = self.CEF(rgb_edge_feature, depth_edge_feature)
+        
+
+        # 增强特征
+        fuse1 = self.emfm1(fuse1, edge_cef)    # fuse1 torch.Size([1, 1024, 12, 12])
+        fuse2 = self.emfm2(fuse2, edge_cef)
+        fuse3 = self.emfm3(fuse3, edge_cef)
+        fuse4 = self.emfm4(fuse4, edge_cef)
+
+        fuse33 = self.upsample1(fuse3)
+        fuse22 = self.upsample2(fuse2)
+        fuse11 = self.upsample3(fuse1)
+        fuse44 = fuse4
+
+        fuse_end = torch.cat((fuse11, fuse22, fuse33, fuse44), dim = 1)
+
+        fuse = self.fuse(fuse_end)  # [1, 1920, 96, 96]  ->  [1, 96, 96, 96]   [B, C, H, W]
+        B , C , H , W = fuse.shape
+        fuse = fuse.reshape(B, H*W, C)   # [1, 9216, 96]
+        fuse_ssm = self.ssm(fuse)   # [1, 9216, 96]
+        b, hw, c = fuse_ssm.shape
+        h = w = int(np.sqrt(hw))
+        fuse_ssm = fuse_ssm.reshape(b, h, w, c)      #  [b ,96, 96, 96]    [b, h, w, c]
+        fuse_ssm = fuse_ssm.permute(0, 3, 1, 2)      #  [b ,96, 96, 96]    [b, c, h, w]
+        # print("fuse_ssm:", fuse_ssm.shape)
+        
+        # fuse_ssm = self.conv96_256(fuse_ssm)
+        fuse_ssm = self.conv96_2048(fuse_ssm)   
+        fuse_ssm = self.pool(fuse_ssm)     # torch.Size([1, 2048, 12, 12])
+        # print("fuse_ssm:", fuse_ssm.shape)
+
+        # print("fuse1", fuse1.shape)   # torch.Size([1, 1024, 12, 12])
+        # print("fuse2", fuse2.shape)   # torch.Size([1, 512, 24, 24])
+        # print("fuse3", fuse3.shape)   # torch.Size([1, 256, 48, 48])
+        # print("fuse4", fuse4.shape)   # torch.Size([1, 128, 96, 96])
+
+        # fuse4 = self.conv1024_256(fuse4.permute(0, 3, 1, 2))
+        # fuse3 = self.conv1024_512(fuse3.permute(0, 3, 1, 2))
+        # fuse2 = fuse2.permute(0, 3, 1, 2)
+        # fuse1 = self.conv1024_2048(fuse1.permute(0, 3, 1, 2))
+
+        # fuse1 torch.Size([2, 2048, 12, 12])
+        # fuse2 torch.Size([2, 1024, 24, 24])
+        # fuse3 torch.Size([2, 512, 48, 48])
+        # fuse4 torch.Size([2, 256, 96, 96])
+
+        out1, out2, out3, out4 = self.decoder(fuse_ssm, fuse1, fuse2, fuse3, fuse4)   
+        # out1 torch.Size([1, 1024, 24, 24])
+        # out2 torch.Size([1, 512, 48, 48])
+        # out3 torch.Size([1, 256, 96, 96])
+        # out4 torch.Size([1, 128, 96, 96])
+        # end_fuse1: torch.Size([2, 256, 96, 96])
+        # end_fuse: torch.Size([2, 256, 96, 96])
+        end_fuse = self.decoder2(fuse_ssm, out1, out2, out3, out4, fuse1, fuse2, fuse3, fuse4)    # [b, 128, 96, 96]
+
+
+        end_sal = self.conv128_32(end_fuse)  # [b,32]
+        end_sal1 = self.conv128_32(out4)
+        rgb_up_edge = self.up_edge(rgb_edge_feature)
+        depth_up_edge = self.up_edge(depth_edge_feature)   # up_edge torch.Size([1, 1, 384, 384])
+        edge_cef_up = self.up_edge(edge_cef)
+        out11 = self.relu(torch.cat((end_sal1, edge_cef), dim=1))
+        out22 = self.relu(torch.cat((end_sal, edge_cef), dim=1))
+        out22 = self.up4(out22)
+        out11 = self.up4(out11)
+        sal_out = self.conv64_1(out22)    # sal_out torch.Size([1, 1, 384, 384])
+        sal_out1 = self.conv64_1(out11)    
+
+        return sal_out, rgb_up_edge, depth_up_edge, sal_out1
+        
+
+    def load_pre(self, pre_model):
+        self.rgb_swin.load_state_dict(torch.load(pre_model)['model'], strict=False)
+        print(f"RGB SwinTransformer loading pre_model ${pre_model}")
+        self.depth_swin.load_state_dict(torch.load(pre_model)['model'], strict=False)
+        print(f"Depth SwinTransformer loading pre_model ${pre_model}")
+
+
+
+
+
+
+class CrossModalAttention(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(CrossModalAttention, self).__init__()
+
+        # RGB 投影
+        self.rgb_query_conv = nn.Conv2d(in_channels, in_channels // reduction_ratio, kernel_size=1)
+        self.rgb_key_conv = nn.Conv2d(in_channels, in_channels // reduction_ratio, kernel_size=1)
+        self.rgb_value_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+
+        # Depth 投影
+        self.depth_query_conv = nn.Conv2d(in_channels, in_channels // reduction_ratio, kernel_size=1)
+        self.depth_key_conv = nn.Conv2d(in_channels, in_channels // reduction_ratio, kernel_size=1)
+        self.depth_value_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+
+        self.softmax = nn.Softmax(dim=-1)
+        self.gamma = nn.Parameter(torch.zeros(1))  # 可学习的融合权重
+
+    def forward(self, rgb_feat, depth_feat):
+        B, C, H, W = rgb_feat.size()
+
+        # RGB Attention to Depth
+        rgb_query = self.rgb_query_conv(rgb_feat).view(B, -1, H * W).permute(0, 2, 1)  # (B, H*W, C')
+        depth_key = self.depth_key_conv(depth_feat).view(B, -1, H * W)  # (B, C', H*W)
+        depth_value = self.depth_value_conv(depth_feat).view(B, -1, H * W)  # (B, C, H*W)
+
+        rgb_to_depth_attn = self.softmax(torch.bmm(rgb_query, depth_key))  # (B, H*W, H*W)
+        rgb_to_depth_out = torch.bmm(depth_value, rgb_to_depth_attn.permute(0, 2, 1))  # (B, C, H*W)
+        rgb_to_depth_out = rgb_to_depth_out.view(B, C, H, W)
+
+        # Depth Attention to RGB
+        depth_query = self.depth_query_conv(depth_feat).view(B, -1, H * W).permute(0, 2, 1)  # (B, H*W, C')
+        rgb_key = self.rgb_key_conv(rgb_feat).view(B, -1, H * W)  # (B, C', H*W)
+        rgb_value = self.rgb_value_conv(rgb_feat).view(B, -1, H * W)  # (B, C, H*W)
+
+        depth_to_rgb_attn = self.softmax(torch.bmm(depth_query, rgb_key))  # (B, H*W, H*W)
+        depth_to_rgb_out = torch.bmm(rgb_value, depth_to_rgb_attn.permute(0, 2, 1))  # (B, C, H*W)
+        depth_to_rgb_out = depth_to_rgb_out.view(B, C, H, W)
+
+        # 融合
+        out = self.gamma * (rgb_to_depth_out + depth_to_rgb_out) + rgb_feat + depth_feat
+
+        return out
+class CMFM_kan(nn.Module):
+    def __init__(self, infeature, w=12, h=12):
+        super(CMFM_kan, self).__init__()
+        # 加胶囊
+        self.semantics_kan = Semantics_kan(A=infeature, B=32, C=32, K=3, P=4, w=w, h=h, out_channel=infeature)
+        # self.attention_module =  SelfAttentionModule()
+        self.cross_attention = CrossModalAttention(infeature)
+        self.conv_act = conv3x3_bn_relu(32, infeature)
+        self.conv_pose = conv3x3_bn_relu(512, infeature)
+        # self.CA = ChannelAttention(512)
+
+
+    def forward(self, r, d):
+        # print("r", r.shape)
+        # print("d", d.shape)
+        Cross_out = self.cross_attention(r, d)
+
+        Ar, Pr = self.semantics_kan(r)  
+        Ad, Pd = self.semantics_kan(d) 
+
+        Ar = self.conv_act(Ar)
+        Ad = self.conv_act(Ad)
+        Pr = self.conv_pose(Pr)
+        Pd = self.conv_pose(Pd)
+
+        rgb_fuse = self.cross_attention(Ar, Pr)
+        depth_fuse = self.cross_attention(Ad, Pd)
+
+        out = rgb_fuse + depth_fuse + Cross_out
+
+        return out
+
+
+
+class EMFM(nn.Module):
+    def __init__(self, infeature, w=12, h=12):
+        super(EMFM, self).__init__()
+
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels=32, out_channels=1, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(1),
+            nn.ReLU(inplace=True)
+        )
+
+
+    def forward(self, fuse, cef_edge):
+        
+        cef_edge = self.conv(cef_edge)
+        cef_edge = F.interpolate(cef_edge, size=(fuse.shape[2], fuse.shape[3]), mode='bilinear', align_corners=True)
+
+        cef_edge_norm = torch.sigmoid(cef_edge)
+
+
+        enhance_out = fuse * cef_edge_norm + fuse
+
+        return enhance_out
+
+
+# Cascaded Decoder
+class Decoder1(nn.Module):
+    def __init__(self):
+        super(Decoder1, self).__init__()
+        self.cfm_s1 = MSFA(2048, 1024)
+        self.cfm_s12 = MSFA(1024, 512)
+        self.cfm_s123 = MSFA(512, 256)
+        self.cfm_s1234 = MSFA(256, 128)
+
+        self.upsample1 = Upsample(target_size=(24, 24))
+        self.upsample2 = Upsample(target_size=(48, 48))
+        self.upsample3 = Upsample(target_size=(96, 96))
+
+        """
+        此处参数：fuse1,fuse2,fuse3,fuse4 特征等级依次升高，通道数逐渐升高，尺寸逐渐减小
+        fuse4:2048,12,12
+        fuse3:1024,24,24
+        fuse2:512,48,48
+        fuse1:256,96,96
+        out为上一个解码器预测的:1,256,96,96
+        """
+
+    def forward(self, fuse_ssm, fuse1, fuse2, fuse3, fuse4):
+        out1 = self.cfm_s1(fuse_ssm, fuse1)    # torch.Size([1, 1024, 12, 12])
+        out1 = self.upsample1(out1)
+
+        out2 = self.cfm_s12(out1, fuse2)
+        out2 = self.upsample2(out2)
+
+        out3 = self.cfm_s123(out2, fuse3)
+        out3 = self.upsample3(out3)
+
+        out4 = self.cfm_s1234(out3, fuse4)
+
+        return out1, out2, out3, out4
+
+class Decoder2(nn.Module):
+    def __init__(self):
+        super(Decoder2, self).__init__()
+        self.cfm_s1 = MSFA(2048, 1024)
+        self.cfm_s12 = MSFA(1024, 512)
+        self.cfm_s123 = MSFA(512, 256)
+        self.cfm_s1234 = MSFA(256, 128)
+
+        self.upsample1 = Upsample(target_size=(24, 24))
+        self.upsample2 = Upsample(target_size=(48, 48))
+        self.upsample3 = Upsample(target_size=(96, 96))
+        self.conv_ssm_fuse1 = conv3x3_bn_relu(3072, 2048)
+        self.conv_out1_fuse2 = conv3x3_bn_relu(1536, 1024)
+        self.conv_out2_fuse3 = conv3x3_bn_relu(768, 512)
+        self.conv_out3_fuse4 = conv3x3_bn_relu(384, 256)
+    
+
+    def forward(self, fuse_ssm, out1, out2, out3, out4, fuse1, fuse2, fuse3, fuse4):
+        # MSFA1
+        fuse_ssm = torch.cat((fuse_ssm, fuse1), dim = 1)
+        fuse_ssm = self.conv_ssm_fuse1(fuse_ssm)
+        fuse_ssm = self.upsample1(fuse_ssm)
+        out1 = torch.cat((out1, fuse2), dim = 1)
+        out1 = self.conv_out1_fuse2(out1)
+        out2_1 = self.cfm_s1(fuse_ssm, out1)    # torch.Size([1, 1024, 24, 24])
+        # MSFA2
+        out2_1 = self.upsample2(out2_1)
+        out2 = torch.cat((out2, fuse3), dim = 1)
+        out2 = self.conv_out2_fuse3(out2)
+        out2_2 = self.cfm_s12(out2_1, out2)
+        # MSFA3
+        out2_2 = self.upsample3(out2_2)
+        out3 = torch.cat((out3, fuse4), dim = 1)
+        out3 = self.conv_out3_fuse4(out3)
+        out2_3 = self.cfm_s123(out2_2, out3)
+        # MSFA4
+        out2_4 = self.cfm_s1234(out2_3, out4)
+
+        return out2_4
+
+class CALayer(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(CALayer, self).__init__()
+        # global average pooling: feature --> point
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # feature channel downscale and upscale --> channel weight
+        self.conv_du = nn.Sequential(
+            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv_du(y)
+        return x * y
+
+
+
+
+class DepthEdgeModule(nn.Module):
+    def __init__(self, in_fea=[128, 256], mid_fea=32):
+        super(DepthEdgeModule, self).__init__()
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(in_fea[0], mid_fea, 1)
+        self.conv4 = nn.Conv2d(in_fea[1], mid_fea, 1)
+        self.conv5_2 = nn.Conv2d(mid_fea, mid_fea, 3, padding=1)
+        self.conv5_4 = nn.Conv2d(mid_fea, mid_fea, 3, padding=1)
+        self.up2 = nn.UpsamplingBilinear2d(scale_factor=2)
+        self.classifer = nn.Conv2d(mid_fea * 2, 1, kernel_size=3, padding=1)
+        self.rcab = RCAB(mid_fea * 2)
+
+
+    def forward(self, x2, x4):
+        _, _, h, w = x2.size()
+        edge2_fea = self.relu(self.conv2(x2))
+        edge2 = self.relu(self.conv5_2(edge2_fea))
+        edge4_fea = self.relu(self.conv4(x4))
+        edge4 = self.relu(self.conv5_4(edge4_fea))
+        edge4 = F.interpolate(edge4, size=(h, w), mode='bilinear', align_corners=True)
+
+        edge = torch.cat([edge2, edge4], dim=1)   # edge: torch.Size([4, 64, 96, 96])
+
+        edge = self.rcab(edge)
+        edge = self.classifer(edge)
+        return edge
+
+class CEF(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16, kernel_size=7):
+        super(CEF, self).__init__()
+        self.ca = ChannelAttention(in_channels, reduction_ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, rgb_e, depth_e):  # 参数名修改
+        # 1. 第一次逐元素相加和CA
+        x_sum1 = rgb_e + depth_e
+        x_ca = self.ca(x_sum1) * x_sum1
+
+        # 2. 第一次乘法和第二次逐元素相加
+        x_mul = rgb_e * depth_e
+        x_sum2 = x_ca + x_mul
+
+        # 3. SA和第二次乘法
+        x_sa = self.sa(x_sum2) * x_sum2
+
+        #4. 与x_sum1再次相加
+        out = x_sa + x_sum1
+        return out
+
+class RGBEdgeModule(nn.Module):
+    def __init__(self, in_channels=[128, 256], mid_channels=32, out_channels=1):
+        super(RGBEdgeModule, self).__init__()
+        self.relu = nn.ReLU(inplace=True)
+
+        # 对 x4 进行处理 (较低分辨率特征, 256 通道)
+        self.conv_x4_1 = nn.Conv2d(in_channels[1], mid_channels, kernel_size=3, padding=1)
+        self.conv_x4_2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1)
+
+        # 对 x2 进行处理 (较高分辨率特征, 128 通道)
+        self.conv_x2_1 = nn.Conv2d(in_channels[0], mid_channels, kernel_size=3, padding=1)
+
+        # 融合和细化: 使用残差块
+        self.res_block = nn.Sequential(
+            nn.Conv2d(2*mid_channels, 2*mid_channels, kernel_size=3, padding=1),  # 输入输出都是 64 通道
+            nn.ReLU(inplace=True),
+            nn.Conv2d(2*mid_channels, 2*mid_channels, kernel_size=3, padding=1)
+        )
+
+        # 输出
+        self.classifier = nn.Conv2d(mid_channels * 2, out_channels, kernel_size=1)
+
+    def forward(self, x2, x4):
+        #_, _, h, w = x2.size()  # 获取 x2 的尺寸, 这行可以省略, 直接使用 96
+        h, w = 96, 96
+
+        # 处理 x4
+        x4 = self.relu(self.conv_x4_1(x4))
+        x4 = self.relu(self.conv_x4_2(x4))
+        x4_up = F.interpolate(x4, size=(h, w), mode='bilinear', align_corners=True) # 上采样到 x2 的大小
+
+        # 处理 x2
+        x2 = self.relu(self.conv_x2_1(x2))
+
+        # 融合 x2 和上采样后的 x4
+        fused = torch.cat([x2, x4_up], dim=1)
+
+        # 残差块
+        residual = fused
+        fused = self.res_block(fused)
+        fused = fused + residual #残差连接
+        fused = self.relu(fused) # 激活
+
+        # 输出边缘图
+        edge = self.classifier(fused)
+        return edge
+    
+if __name__ == '__main__':
+    MICNet = MICNet()
+    a = torch.randn([2, 3, 384, 384])
+    b = torch.randn([2, 3, 384, 384])
+    s, e, s1 = MICNet(a, b)
+    print("s.shape:", e.shape)
